@@ -6,7 +6,7 @@ from __future__ import annotations
 import csv
 import re
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote
 
 from benchmarks.dataset.prepare import (
@@ -92,8 +92,12 @@ def load_ming_freeform_samples(
     }
     meta_file = hf_hub_download(filename=meta_repo_path, **download_kwargs)
     rows = _read_metadata(Path(meta_file), meta_repo_path)
+    if max_samples is not None:
+        rows = rows[:max_samples]
+    else:
+        pass
 
-    samples: list[SpeechEditSample] = []
+    output_names: set[str] = set()
     for row_number, row in rows:
         sample_id, audio_repo_path, instruction, original_text, edited_text = row
         _validate_row(
@@ -105,6 +109,17 @@ def load_ming_freeform_samples(
             meta_repo_path=meta_repo_path,
             row_number=row_number,
         )
+        output_name = sample_id.casefold()
+        if output_name in output_names:
+            raise ValueError(
+                f"Duplicate sample id {sample_id!r} in {meta_repo_path} row {row_number}"
+            )
+        else:
+            output_names.add(output_name)
+
+    samples: list[SpeechEditSample] = []
+    for _, row in rows:
+        sample_id, audio_repo_path, instruction, original_text, edited_text = row
         source_audio = hf_hub_download(filename=audio_repo_path, **download_kwargs)
         samples.append(
             SpeechEditSample(
@@ -120,8 +135,6 @@ def load_ming_freeform_samples(
                 scale=_instruction_scale(task, instruction),
             )
         )
-        if max_samples is not None and len(samples) >= max_samples:
-            break
     return samples
 
 
@@ -159,8 +172,16 @@ def _validate_row(
     if not all((sample_id, instruction, original_text, edited_text)):
         raise ValueError(f"Empty required field in {meta_repo_path} row {row_number}")
     sample_path = PurePosixPath(sample_id)
-    if sample_path.name != sample_id or sample_id in {".", ".."}:
+    if (
+        sample_path.name != sample_id
+        or sample_id in {".", ".."}
+        or re.search(r'[<>:"/\\|?*\x00-\x1f]', sample_id)
+        or sample_id != sample_id.rstrip(". ")
+        or PureWindowsPath(sample_id).is_reserved()
+    ):
         raise ValueError(f"Invalid sample id {sample_id!r} in {meta_repo_path}")
+    else:
+        pass
     audio_path = PurePosixPath(audio_repo_path)
     if (
         audio_path.is_absolute()
@@ -168,10 +189,13 @@ def _validate_row(
         or len(audio_path.parts) != 2
         or audio_path.parts[0] != "wavs"
         or audio_path.suffix.lower() != ".wav"
+        or "\\" in audio_repo_path
     ):
         raise ValueError(
             f"Invalid source audio path {audio_repo_path!r} in {meta_repo_path}"
         )
+    else:
+        pass
 
 
 def _instruction_scale(task: str, instruction: str) -> float | None:

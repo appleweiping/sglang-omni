@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import sys
 import types
 import wave
@@ -23,6 +24,8 @@ from benchmarks.dataset import prepare
 from benchmarks.eval.benchmark_auk_audio_edit import (
     _build_auk_edit_request,
     _make_auk_edit_send_fn,
+    parse_args,
+    run_benchmark,
 )
 from benchmarks.metrics.speech_edit import (
     aggregate_signal_edit_scores,
@@ -124,13 +127,14 @@ def test_headerless_dialect_metadata_keeps_first_sample(
     assert [sample.sample_id for sample in samples] == ["sample-1"]
 
 
+@pytest.mark.parametrize("audio_repo_path", ["../secret.wav", r"wavs/..\secret.wav"])
 def test_loader_rejects_audio_path_traversal_before_download(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, audio_repo_path: str
 ) -> None:
     meta = tmp_path / "metadata.csv"
     meta.write_text(
         "file_name|path|instruction|original_text|edited_text\n"
-        "sample-1|../secret.wav|Remove the first word.|before|after\n",
+        f"sample-1|{audio_repo_path}|Remove the first word.|before|after\n",
         encoding="utf-8",
     )
     calls: list[dict] = []
@@ -144,6 +148,68 @@ def test_loader_rejects_audio_path_traversal_before_download(
         ming_edit.load_ming_freeform_samples("deletion")
 
     assert [call["filename"] for call in calls] == [
+        "meta/del/meta_en_deletion_basic.csv"
+    ]
+
+
+@pytest.mark.parametrize(
+    "sample_id", [r"..\escaped", "C:escaped", "sample:stream", "sample.", "CON"]
+)
+def test_loader_rejects_nonportable_output_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_id: str
+) -> None:
+    """A metadata identifier must not escape or alias a generated WAV filename."""
+    metadata_file = tmp_path / "metadata.csv"
+    metadata_file.write_text(
+        "file_name|path|instruction|original_text|edited_text\n"
+        f"{sample_id}|wavs/source.wav|Remove a word.|before|after\n",
+        encoding="utf-8",
+    )
+    download_calls: list[dict] = []
+    source_audio_path = tmp_path / "source.wav"
+    write_wav(source_audio_path, np.zeros(1, dtype=np.float32))
+    install_hub(
+        monkeypatch,
+        {
+            "meta/del/meta_en_deletion_basic.csv": metadata_file,
+            "wavs/source.wav": source_audio_path,
+        },
+        download_calls,
+    )
+    with pytest.raises(ValueError, match="Invalid sample id"):
+        ming_edit.load_ming_freeform_samples("deletion")
+    assert [call["filename"] for call in download_calls] == [
+        "meta/del/meta_en_deletion_basic.csv"
+    ]
+
+
+@pytest.mark.parametrize("second_id", ["sample-1", "SAMPLE-1"])
+def test_loader_rejects_colliding_output_names_before_audio_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, second_id: str
+) -> None:
+    """Duplicate identifiers must not overwrite WAVs or associate scores with another row."""
+    metadata_file = tmp_path / "metadata.csv"
+    metadata_file.write_text(
+        "file_name|path|instruction|original_text|edited_text\n"
+        "sample-1|wavs/one.wav|Remove one word.|before|after\n"
+        f"{second_id}|wavs/two.wav|Remove two words.|before|after\n",
+        encoding="utf-8",
+    )
+    download_calls: list[dict] = []
+    source_audio_path = tmp_path / "source.wav"
+    write_wav(source_audio_path, np.zeros(1, dtype=np.float32))
+    install_hub(
+        monkeypatch,
+        {
+            "meta/del/meta_en_deletion_basic.csv": metadata_file,
+            "wavs/one.wav": source_audio_path,
+            "wavs/two.wav": source_audio_path,
+        },
+        download_calls,
+    )
+    with pytest.raises(ValueError, match="Duplicate sample id"):
+        ming_edit.load_ming_freeform_samples("deletion")
+    assert [call["filename"] for call in download_calls] == [
         "meta/del/meta_en_deletion_basic.csv"
     ]
 
@@ -368,3 +434,93 @@ def test_audio_edit_benchmark_over_local_http(
         assert not result.is_success
         assert "HTTP 503: fixture unavailable" in result.error
         assert not list(generated_audio_directory.glob("*.wav"))
+
+
+def test_audio_edit_report_keeps_http_failures_in_denominator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A partial HTTP failure must remain in the saved report, not improve apparent coverage."""
+    metadata_file = tmp_path / "metadata.csv"
+    metadata_file.write_text(
+        "file_name|path|instruction|original_text|edited_text\n"
+        "success|wavs/source.wav|adjusts the speed to 2.0|before|after\n"
+        "failed|wavs/source.wav|adjusts the speed to 3.0|before|after\n",
+        encoding="utf-8",
+    )
+    source_audio_path = tmp_path / "source.wav"
+    write_wav(source_audio_path, np.full(20, 0.25, dtype=np.float32))
+    generated_audio_bytes = wav_bytes(np.full(10, 0.25, dtype=np.float32))
+    output_directory = tmp_path / "results"
+    install_hub(
+        monkeypatch,
+        {
+            "meta/time_stretch/meta_en_time_stretch.csv": metadata_file,
+            "wavs/source.wav": source_audio_path,
+        },
+        [],
+    )
+
+    async def generate_audio(request: web.Request) -> web.Response:
+        request_payload = await request.json()
+        assert isinstance(request_payload, dict)
+        if request_payload["prompt"].endswith("3.0"):
+            return web.Response(status=503, text="fixture unavailable")
+        else:
+            return web.json_response(
+                {
+                    "audio": {
+                        "data": base64.b64encode(generated_audio_bytes).decode("ascii"),
+                        "format": "wav",
+                    }
+                }
+            )
+
+    async def run_report() -> None:
+        application = web.Application()
+        application.router.add_post("/generate", generate_audio)
+        async with TestServer(application) as server:
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                [
+                    "benchmark_auk_audio_edit",
+                    "--base-url",
+                    str(server.make_url("/")),
+                    "--output-dir",
+                    str(output_directory),
+                    "--max-samples",
+                    "2",
+                    "--max-concurrency",
+                    "2",
+                ],
+            )
+            await run_benchmark(parse_args())
+
+    asyncio.run(run_report())
+    saved_report = json.loads(
+        (output_directory / "ming_freeform_audio_edit_results.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(saved_report["per_sample"]) == 2
+    by_sample_id = {
+        sample["request_id"]: sample for sample in saved_report["per_sample"]
+    }
+    assert by_sample_id["success"]["is_success"]
+    assert by_sample_id["success"]["signal_metrics"][
+        "relative_duration_error"
+    ] == pytest.approx(0)
+    assert not by_sample_id["failed"]["is_success"]
+    assert "HTTP 503" in by_sample_id["failed"]["error"]
+    assert by_sample_id["failed"]["signal_metrics"] is None
+    assert saved_report["signal_metrics"]["evaluated"] == 1
+    assert saved_report["speed"]["total_requests"] == 2
+    assert saved_report["speed"]["completed_requests"] == 1
+    assert saved_report["speed"]["failed_requests"] == 1
+    assert (
+        saved_report["config"]["dataset_revision"]
+        == prepare.MING_FREEFORM_AUDIO_EDIT_DATASET_REVISION
+    )
+    assert sorted(
+        path.name for path in (output_directory / "generated").glob("*.wav")
+    ) == ["success.wav"]
